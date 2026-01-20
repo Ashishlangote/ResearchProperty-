@@ -1,5 +1,4 @@
 import uuid
-import os
 from dotenv import load_dotenv
 from typing import Annotated, Optional, List
 from typing_extensions import TypedDict
@@ -16,7 +15,7 @@ from langgraph.graph.message import AnyMessage, add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from utils import price_to_number
-from utils import get_mongo_collection
+from utils import get_mongo_collection, mongo_documents_to_string
 
 load_dotenv()
 
@@ -112,10 +111,9 @@ def mongo_housing_search(
         })
 
     if not results:
-        return "No matching projects found."
+        return str(mongo_documents_to_string()[:5000])
 
-    return results[:5]
-
+    return results
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
