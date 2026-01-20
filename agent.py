@@ -1,49 +1,121 @@
-from this import s
 import uuid
 import os
 from dotenv import load_dotenv
-from typing import Annotated
+from typing import Annotated, Optional, List
 from typing_extensions import TypedDict
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import ToolMessage, AIMessage
 from langchain_core.runnables import RunnableLambda, Runnable
 from langchain_core.tools import tool
+
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import AnyMessage, add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from firecrawl import FirecrawlApp
+
+from utils import price_to_number
+from utils import get_mongo_collection
 
 load_dotenv()
 
-app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
-
-
 @tool
-def housing_search(city: str):
+def mongo_housing_search(
+    city: str,
+    locality: Optional[str] = None,
+    bhk: Optional[str] = None,
+    min_budget_lakh: Optional[float] = None,
+    max_budget_lakh: Optional[float] = None,
+    project_status: Optional[str] = None,
+    amenities: Optional[List[str]] = None,
+    developer: Optional[str] = None,
+    rera_only: Optional[bool] = False
+):
     """
-    Search top residential projects in the given city from Housing.com.
-
-    Args:
-        city (str): The city to search for (e.g., "Pune").
-
-    Returns:
-        A list of dictionaries. Each dictionary includes:
-        - project: Project name
-        - location: Area/locality in the city
-        - bhk_details: List of BHK type with price (e.g. 2 BHK - ₹1.2 Cr)
-        - price_range: Overall min-max price range (optional)
-        - link: Link to the full project page
+    Search residential projects from MongoDB.
     """
-    try:
-        city = city.lower().strip()
-        url=f"https://housing.com/in/buy/{city}/{city}"
-        result_markdown = app.scrape(url, formats=['markdown'])
-        if result_markdown is not None:
-            return str(result_markdown.markdown).strip().replace("\n\n", " ")[:9000]
-    except Exception as e:
-        return f"Failed to fetch listings for {city}. Error: {str(e)}"
+    print("🏘️ Mongo Housing Search Called")
+
+    collection = get_mongo_collection()
+
+    # ---------------------------
+    # BASE QUERY
+    # ---------------------------
+    query = {
+        "location.city": {"$regex": f"^{city}$", "$options": "i"}
+    }
+
+    if locality:
+        query["location.locality"] = {"$regex": locality, "$options": "i"}
+
+    if project_status:
+        query["project_status"] = {"$regex": project_status, "$options": "i"}
+
+    if amenities:
+        query["amenities"] = {"$all": amenities}
+
+    if developer:
+        query["developer"] = {"$regex": developer, "$options": "i"}
+
+    if rera_only:
+        query["rera_id"] = {"$exists": True, "$ne": ""}
+
+    projects = list(collection.find(query))
+
+    results = []
+
+    for project in projects:
+
+        # 🔹 Budget filter (PROJECT LEVEL)
+        try:
+            min_price = price_to_number(
+                project["price_details"]["price_range"]["min_all_inclusive"]
+            )
+            max_price = price_to_number(
+                project["price_details"]["price_range"]["max_all_inclusive"]
+            )
+        except Exception:
+            continue
+
+        if min_budget_lakh and max_price < min_budget_lakh:
+            continue
+        if max_budget_lakh and min_price > max_budget_lakh:
+            continue
+
+        # 🔹 BHK filter (CONFIG LEVEL)
+        bhk_details = []
+
+        for config in project.get("configuration", []):
+            if bhk and bhk.lower() not in config.get("type", "").lower():
+                continue
+
+            bhk_details.append({
+                "type": config["type"],
+                "carpet_area_sqft": config.get("carpet_area_sqft")
+            })
+
+        if bhk and not bhk_details:
+            continue
+
+        results.append({
+            "project_name": project["project_name"],
+            "developer": project.get("developer"),
+            "locality": project["location"].get("locality"),
+            "city": project["location"].get("city"),
+            "bhk_available": bhk_details,
+            "price_range": project["price_details"]["price_range"],
+            "project_status": project.get("project_status"),
+            "possession": project.get("possession", {}).get("start"),
+            "amenities": project.get("amenities", [])[:5],
+            "rera_id": project.get("rera_id")
+        })
+
+    if not results:
+        return "No matching projects found."
+
+    return results[:5]
+
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
@@ -52,13 +124,12 @@ def handle_tool_error(state) -> dict:
     return {
         "messages": [
             ToolMessage(
-                content=f"Error: {repr(error)}\nPlease check the city name or try again later.",
+                content=f"Error: {repr(error)}\nPlease try again with valid details.",
                 tool_call_id=tc["id"],
             )
             for tc in tool_calls
         ]
     }
-
 
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
@@ -77,8 +148,7 @@ class Assistant:
                 or isinstance(result.content, list)
                 and not result.content[0].get("text")
             ):
-                messages = state["messages"] + [("user", "Respond with a real output.")]
-                state = {**state, "messages": messages}
+                state["messages"].append(("user", "Please give a valid response."))
             else:
                 break
 
@@ -86,35 +156,53 @@ class Assistant:
 
 
 class RealEstateAssistant:
-    def __init__(self, thread_id: str = ""):
+    def __init__(self, thread_id: Optional[str] = None):
         load_dotenv()
-        self.api_key = os.getenv("GOOGLE")
-        self.llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.7)
-        self.tools = [housing_search]
+
+        self.llm = ChatGroq(
+            model="openai/gpt-oss-20b",
+            temperature=0
+        )
+
+        self.tools = [mongo_housing_search]
         self.prompt = self._build_prompt()
         self.assistant = Assistant(self.prompt | self.llm.bind_tools(self.tools))
+
         self.memory = MemorySaver()
         self.graph = self._build_graph()
-        self.thread_id = str(uuid.uuid4()) if thread_id is None else thread_id
+        self.thread_id = thread_id or str(uuid.uuid4())
 
     def _build_prompt(self):
         return ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    '''You are a smart real estate assistant.
-                    If a user asks about buying flats in a city, call the `housing_search` tool with that city name.
-                    Only use the tool if the user explicitly mentions a city.
-                    Once you get the data, show the top 3-5 listings in a user-friendly format including:
-                    - For each project, display:
-                      - Project name
-                      - Location
-                      - BHK types and prices
-                      - Total price range
-                      - Link to full listing
+                    """
+                    You are a smart Indian real estate assistant.
 
-                    Note - Never mention where this data is sourced from or refer to external websites.
-                    '''
+                    CRITICAL TOOL RULES (FOLLOW STRICTLY):
+                    - Tool arguments MUST match expected data types.
+                    - min_budget_lakh and max_budget_lakh MUST be NUMBERS (float).
+                    - NEVER pass strings like "1 crore", "80 lakh", "₹1 Cr".
+
+                    BUDGET CONVERSION RULES:
+                    - 1 crore = 100
+                    - 1.2 crore = 120
+                    - 85 lakh = 85
+
+                    EXAMPLES:
+                    - "under 1 crore" → max_budget_lakh = 100
+                    - "below 85 lakh" → max_budget_lakh = 85
+                    - "80L to 1.2Cr" → min_budget_lakh = 80, max_budget_lakh = 120
+
+                    If you cannot confidently convert a budget to a NUMBER,
+                    DO NOT pass that argument to the tool.
+
+                    If user intent is about buying/searching flats,
+                    YOU MUST call `mongo_housing_search`.
+
+                    Never mention databases or data sources.
+                    """
                 ),
                 ("placeholder", "{messages}"),
             ]
@@ -123,22 +211,27 @@ class RealEstateAssistant:
     def _build_graph(self):
         builder = StateGraph(State)
         builder.add_node("assistant", self.assistant)
-        builder.add_node("tools", self._create_tool_node_with_fallback())
+        builder.add_node("tools", self._create_tool_node())
         builder.add_edge(START, "assistant")
         builder.add_conditional_edges("assistant", tools_condition)
         builder.add_edge("tools", "assistant")
         return builder.compile(checkpointer=self.memory)
 
-    def _create_tool_node_with_fallback(self):
+    def _create_tool_node(self):
         return ToolNode(self.tools).with_fallbacks(
             [RunnableLambda(handle_tool_error)],
             exception_key="error"
         )
 
-    def chat(self, message: str) -> str:
+    def chat(self, message: str):
         config = {"configurable": {"thread_id": self.thread_id}}
         state = {"messages": [("user", message)]}
-        events = self.graph.stream(state, config, stream_mode="messages")
+
+        events = self.graph.stream(
+            state,
+            config,
+            stream_mode="messages"
+        )
 
         for event in events:
             msg = event[0]
@@ -147,17 +240,5 @@ class RealEstateAssistant:
 
 
 # assistant = RealEstateAssistant()
-# print("💬 Real Estate Assistant Bot (type 'exit' to quit)\n")
-
-# while True:
-#     user_input = input("You: ")
-
-#     if user_input.strip().lower() in {"exit", "quit"}:
-#         print("👋 Goodbye!")
-#         break
-
-#     try:
-#         response = assistant.chat(user_input)
-#         print("Assistant:", response, "\n")
-#     except Exception as e:
-#         print("⚠️ Error:", e)
+# for reply in assistant.chat("2 BHK flats in Wakad under 1 crore with swimming pool"):
+#     print(reply)
